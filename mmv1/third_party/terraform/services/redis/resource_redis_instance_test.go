@@ -1,12 +1,18 @@
 package redis_test
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	resourcemanagerpb "cloud.google.com/go/resourcemanager/apiv3/resourcemanagerpb"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/hashicorp/terraform-provider-google/google/acctest"
 	"github.com/hashicorp/terraform-provider-google/google/envvar"
+	"google.golang.org/api/iterator"
 )
 
 func TestAccRedisInstance_update(t *testing.T) {
@@ -413,12 +419,15 @@ func TestAccRedisInstance_tags(t *testing.T) {
 	t.Parallel()
 
 	tagKey := acctest.BootstrapSharedTestOrganizationTagKey(t, "redis-instances-tagkey", map[string]interface{}{})
+	tagValue := acctest.BootstrapSharedTestOrganizationTagValue(t, "redis-instances-tagvalue", tagKey)
 	context := map[string]interface{}{
 		"org":           envvar.GetTestOrgFromEnv(t),
 		"tagKey":        tagKey,
-		"tagValue":      acctest.BootstrapSharedTestOrganizationTagValue(t, "redis-instances-tagvalue", tagKey),
+		"tagValue":      tagValue,
 		"random_suffix": acctest.RandString(t, 10),
 	}
+	resourceName := "google_redis_instance.test"
+
 	acctest.VcrTest(t, resource.TestCase{
 		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
 		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
@@ -426,9 +435,8 @@ func TestAccRedisInstance_tags(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config: testAccRedisInstanceTags(context),
-				Check: resource.TestCheckFunc(
-					resource.TestCheckResourceAttrSet(
-						"google_redis_instance.test", "tags.%"),
+				Check: resource.ComposeTestCheckFunc(
+					checkTagBinding(resourceName, tagValue),
 				),
 			},
 			{
@@ -452,4 +460,45 @@ func testAccRedisInstanceTags(context map[string]interface{}) string {
   }
 }
 `, context)
+}
+
+func checkTagBinding(resourceName, expectedTagValue string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+
+		rs, ok := s.RootModule().Resources[resourceName] //retrieve resource information
+		if !ok {
+			return fmt.Errorf("Resource not found")
+		}
+		instanceID := rs.Primary.ID
+		if instanceID == "" {
+			return fmt.Errorf("Instance ID is empty")
+		}
+		ctx := context.Background()
+		client, err := resourcemanager.NewTagBindingsClient(ctx) //create tagBindings Client
+		if err != nil {
+			return fmt.Errorf("failed to create tag bindings client: %v", err)
+
+		}
+		defer client.Close()
+
+		req := &resourcemanagerpb.ListTagBindingsRequest{
+			Parent: fmt.Sprintf("//cloudresourcemanager.googleapis.com/projects/%s", rs.Primary.Attributes["project"]),
+		}
+
+		it := client.ListTagBindings(ctx, req) //list tag bindings
+		for {
+			tagBinding, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("Error listing tag bindings: %v", err)
+			}
+			if strings.Contains(tagBinding.TagValue, expectedTagValue) && strings.Contains(tagBinding.Parent, instanceID) { //iterate and chcek for tagBindings
+				return nil
+			}
+		}
+
+		return fmt.Errorf("expected tag value %q not attached to instance %s", expectedTagValue, instanceID)
+	}
 }
